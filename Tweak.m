@@ -34,6 +34,15 @@ static OSStatus my_AudioQueueEnqueueBuffer(AudioQueueRef q, AudioQueueBufferRef 
 static OSStatus (*orig_AudioUnitSetProperty)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void *, UInt32);
 static OSStatus my_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID p, AudioUnitScope s, AudioUnitElement e, const void *d, UInt32 sz) {
     atomic_fetch_add(&cSetProp, 1);
+    if (p == kAudioUnitProperty_SetRenderCallback && d && sz >= sizeof(AURenderCallbackStruct)) {
+        const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)d;
+        FXLog([NSString stringWithFormat:@"RenderCallback scope=%u elem=%u fn=%p", (unsigned)s, (unsigned)e, cb->inputProc]);
+    }
+    if (p == kAudioUnitProperty_StreamFormat && d && sz >= sizeof(AudioStreamBasicDescription)) {
+        const AudioStreamBasicDescription *f = (const AudioStreamBasicDescription *)d;
+        FXLog([NSString stringWithFormat:@"StreamFormat scope=%u rate=%.0f flags=0x%x bits=%u ch=%u fmt=%u",
+               (unsigned)s, f->mSampleRate, (unsigned)f->mFormatFlags, (unsigned)f->mBitsPerChannel, (unsigned)f->mChannelsPerFrame, (unsigned)f->mFormatID]);
+    }
     return orig_AudioUnitSetProperty(u, p, s, e, d, sz);
 }
 
