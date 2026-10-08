@@ -1,0 +1,33 @@
+name: Build dylib
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer les outils
+        run: brew install ldid make
+
+      - name: Installer Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Récupérer les SDK
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          cp -R /tmp/sdks/*.sdk $HOME/theos/sdks/
+
+      - name: Compiler
+        run: gmake FINALPACKAGE=1
+
+      - name: Publier la dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpotifyFX
+          path: .theos/obj/**/*.dylib
