@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = SpotifyFX
 
-SpotifyFX_FILES = Tweak.m
+SpotifyFX_FILES = Tweak.m fishhook.c
 SpotifyFX_CFLAGS = -fobjc-arc
 SpotifyFX_FRAMEWORKS = Foundation UIKit AudioToolbox
 
