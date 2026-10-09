@@ -4,6 +4,7 @@
 #include "fishhook.h"
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 static void FXLog(NSString *msg) {
@@ -20,25 +21,53 @@ static void FXLog(NSString *msg) {
     }
 }
 
-// ---------- Paramètres (écrits par l'UI, lus par le thread audio) ----------
-static _Atomic float gBassDb = 0.0f;
-static _Atomic float gTrebleDb = 0.0f;
-static _Atomic float gGainDb = 0.0f;
+// ================= PARAMÈTRES =================
+
+typedef enum {
+    P_VOL, P_BASS, P_MID, P_TREBLE, P_BASSF, P_TREBF,
+    P_WIDTH, P_BAL, P_SAT,
+    P_REVMIX, P_REVSIZE, P_REVDAMP,
+    P_ECHOMIX, P_ECHOTIME, P_ECHOFB,
+    P_COUNT
+} ParamId;
+
+typedef struct { const char *name; const char *unit; float min, max, def; } ParamDef;
+
+static const ParamDef kDefs[P_COUNT] = {
+    {"Volume",            "dB", -40,  30,    0},
+    {"Basses",            "dB", -30,  30,    0},
+    {"Médiums",           "dB", -30,  30,    0},
+    {"Aigus",             "dB", -30,  30,    0},
+    {"Fréquence basses",  "Hz",  40, 400,  100},
+    {"Fréquence aigus",   "Hz", 2000, 14000, 8000},
+    {"Largeur stéréo",    "%",    0, 300,  100},
+    {"Balance G/D",       "%", -100, 100,    0},
+    {"Saturation",        "%",    0, 100,    0},
+    {"Reverb mix",        "%",    0, 200,    0},
+    {"Reverb taille",     "%",    0, 100,   50},
+    {"Reverb amorti",     "%",    0, 100,   50},
+    {"Écho mix",          "%",    0, 150,    0},
+    {"Écho délai",        "ms",  20, 1500, 350},
+    {"Écho répétitions",  "%",    0,  95,   35},
+};
+
+static _Atomic float gP[P_COUNT];
 static _Atomic float gSampleRate = 44100.0f;
 static atomic_int gActive = 1;
 static atomic_int outIsFloat;
 static atomic_int cCallback;
 static atomic_int peakPost;
 
-// ---------- Biquads ----------
+#define GP(i) atomic_load_explicit(&gP[i], memory_order_relaxed)
+
+// ================= DSP =================
+
 typedef struct { float b0, b1, b2, a1, a2; } Coef;
 typedef struct { float z1, z2; } State;
 
-static Coef gLow = {1, 0, 0, 0, 0};
-static Coef gHigh = {1, 0, 0, 0, 0};
-static State gState[2][2];            // [filtre][canal]
-static float gCBass = -999.f, gCTreble = -999.f, gCRate = 0.f;
-static float gCGain = 1.0f, gCGainDb = -999.f;
+static Coef gCoef[3] = {{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0}};   // 0 basses, 1 médiums, 2 aigus
+static State gSt[3][2];
+static float gCEq[6] = {-999,-999,-999,-999,-999,-999};
 
 static Coef shelf(int high, float dB, float fs, float f0) {
     float A = powf(10.0f, dB / 40.0f);
@@ -66,24 +95,68 @@ static Coef shelf(int high, float dB, float fs, float f0) {
     return c;
 }
 
-static inline float biquad(const Coef *c, State *s, float x) {
+static Coef peaking(float dB, float fs, float f0, float Q) {
+    float A = powf(10.0f, dB / 40.0f);
+    float w0 = 2.0f * (float)M_PI * f0 / fs;
+    float cw = cosf(w0), alpha = sinf(w0) / (2.0f * Q);
+    float b0 = 1 + alpha * A, b1 = -2 * cw, b2 = 1 - alpha * A;
+    float a0 = 1 + alpha / A, a1 = -2 * cw, a2 = 1 - alpha / A;
+    Coef c = { b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0 };
+    return c;
+}
+
+static inline float biq(const Coef *c, State *s, float x) {
     float y = c->b0 * x + s->z1;
     s->z1 = c->b1 * x - c->a1 * y + s->z2;
     s->z2 = c->b2 * x - c->a2 * y;
     return y;
 }
 
-static inline float processSample(float x, int ch) {
-    x *= gCGain;
-    x = biquad(&gLow, &gState[0][ch], x);
-    x = biquad(&gHigh, &gState[1][ch], x);
+static inline float limiter(float x) {
     float a = fabsf(x);
     if (a > 0.9f) {
         float t = 0.9f + 0.1f * tanhf((a - 0.9f) / 0.1f);
-        x = copysignf(t, x);
+        return copysignf(t, x);
     }
     return x;
 }
+
+// ---- Reverb (type Freeverb) ----
+#define COMB_N 8
+#define AP_N 4
+#define COMB_MAX 4096
+#define AP_MAX 2048
+static const int kCombT[COMB_N] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+static const int kApT[AP_N] = {556, 441, 341, 225};
+static const int kSpread = 23;
+
+static float combBuf[2][COMB_N][COMB_MAX];
+static float combStore[2][COMB_N];
+static int combIdx[2][COMB_N], combLen[2][COMB_N];
+static float apBuf[2][AP_N][AP_MAX];
+static int apIdx[2][AP_N], apLen[2][AP_N];
+
+static void setReverbLengths(float fs) {
+    float sc = fs / 44100.0f;
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < COMB_N; i++) {
+            int l = (int)((kCombT[i] + c * kSpread) * sc);
+            if (l < 1) l = 1; if (l > COMB_MAX) l = COMB_MAX;
+            combLen[c][i] = l; combIdx[c][i] = 0;
+        }
+        for (int i = 0; i < AP_N; i++) {
+            int l = (int)((kApT[i] + c * kSpread) * sc);
+            if (l < 1) l = 1; if (l > AP_MAX) l = AP_MAX;
+            apLen[c][i] = l; apIdx[c][i] = 0;
+        }
+    }
+}
+
+// ---- Écho (ping-pong) ----
+#define ECHO_MAX 192000
+static float echoBuf[2][ECHO_MAX];
+static int echoIdx = 0;
+static float gCRate = 0.f;
 
 typedef struct {
     AURenderCallback proc;
@@ -107,39 +180,127 @@ static OSStatus fx_render(void *inRefCon,
     if (!atomic_load(&outIsFloat)) return st;
     if (!atomic_load(&gActive)) return st;
 
-    float bass = atomic_load(&gBassDb);
-    float treble = atomic_load(&gTrebleDb);
-    float gdb = atomic_load(&gGainDb);
-    float fs = atomic_load(&gSampleRate);
-    if (bass != gCBass || fs != gCRate) { gLow = shelf(0, bass, fs, 100.0f); gCBass = bass; }
-    if (treble != gCTreble || fs != gCRate) { gHigh = shelf(1, treble, fs, 8000.0f); gCTreble = treble; }
-    gCRate = fs;
-    if (gdb != gCGainDb) { gCGain = powf(10.0f, gdb / 20.0f); gCGainDb = gdb; }
-
-    float post = 0.f;
-
+    // Accès aux canaux (entrelacé ou non)
+    float *pl = NULL, *pr = NULL;
+    UInt32 stride = 1, frames = 0;
     if (ioData->mNumberBuffers == 1) {
         UInt32 ch = ioData->mBuffers[0].mNumberChannels;
         if (ch == 0) ch = 2;
-        float *s = (float *)ioData->mBuffers[0].mData;
-        UInt32 n = ioData->mBuffers[0].mDataByteSize / sizeof(float);
-        if (!s) return st;
-        for (UInt32 i = 0; i < n; i++) {
-            int c = (int)(i % ch); if (c > 1) c = 1;
-            s[i] = processSample(s[i], c);
-            float a = fabsf(s[i]); if (a > post) post = a;
+        if (ch != 2) return st;
+        pl = (float *)ioData->mBuffers[0].mData;
+        if (!pl) return st;
+        pr = pl + 1; stride = 2;
+        frames = ioData->mBuffers[0].mDataByteSize / (sizeof(float) * 2);
+    } else if (ioData->mNumberBuffers >= 2) {
+        pl = (float *)ioData->mBuffers[0].mData;
+        pr = (float *)ioData->mBuffers[1].mData;
+        if (!pl || !pr) return st;
+        stride = 1;
+        UInt32 a = ioData->mBuffers[0].mDataByteSize, b = ioData->mBuffers[1].mDataByteSize;
+        frames = (a < b ? a : b) / sizeof(float);
+    } else return st;
+
+    // --- Lecture des paramètres ---
+    float fs = atomic_load(&gSampleRate);
+    float eq[6] = { GP(P_BASS), GP(P_MID), GP(P_TREBLE), GP(P_BASSF), GP(P_TREBF), fs };
+    int changed = 0;
+    for (int i = 0; i < 6; i++) if (eq[i] != gCEq[i]) changed = 1;
+    if (changed) {
+        float tf = eq[4]; if (tf > fs * 0.45f) tf = fs * 0.45f;
+        gCoef[0] = shelf(0, eq[0], fs, eq[3]);
+        gCoef[1] = peaking(eq[1], fs, 1000.0f, 0.7f);
+        gCoef[2] = shelf(1, eq[2], fs, tf);
+        for (int i = 0; i < 6; i++) gCEq[i] = eq[i];
+    }
+    if (fs != gCRate) { setReverbLengths(fs); gCRate = fs; }
+
+    float volLin = powf(10.0f, GP(P_VOL) / 20.0f);
+    float satAmt = GP(P_SAT) / 100.0f;
+    float drive = 1.0f + satAmt * 8.0f;
+    float satComp = 1.0f / sqrtf(drive);
+    float width = GP(P_WIDTH) / 100.0f;
+    float bal = GP(P_BAL) / 100.0f;
+    float gl = bal > 0 ? 1.0f - bal : 1.0f;
+    float gr = bal < 0 ? 1.0f + bal : 1.0f;
+
+    float revMix = GP(P_REVMIX) / 100.0f;
+    float revFb = 0.7f + 0.28f * (GP(P_REVSIZE) / 100.0f);
+    float damp = (GP(P_REVDAMP) / 100.0f) * 0.4f;
+    float wetGain = revMix * 3.0f;
+    float dryGain = 1.0f - 0.4f * (revMix > 1.0f ? 1.0f : revMix);
+    int doRev = revMix > 0.001f;
+
+    float echoMix = GP(P_ECHOMIX) / 100.0f;
+    float echoFb = GP(P_ECHOFB) / 100.0f;
+    int echoDelay = (int)(GP(P_ECHOTIME) * 0.001f * fs);
+    if (echoDelay < 1) echoDelay = 1;
+    if (echoDelay > ECHO_MAX - 1) echoDelay = ECHO_MAX - 1;
+
+    float post = 0.f;
+
+    for (UInt32 i = 0; i < frames; i++) {
+        float l = pl[i * stride], r = pr[i * stride];
+
+        // EQ : basses, médiums, aigus
+        l = biq(&gCoef[0], &gSt[0][0], l); l = biq(&gCoef[1], &gSt[1][0], l); l = biq(&gCoef[2], &gSt[2][0], l);
+        r = biq(&gCoef[0], &gSt[0][1], r); r = biq(&gCoef[1], &gSt[1][1], r); r = biq(&gCoef[2], &gSt[2][1], r);
+
+        // Saturation
+        if (satAmt > 0.001f) {
+            float wl = tanhf(l * drive) * satComp, wr = tanhf(r * drive) * satComp;
+            l += (wl - l) * satAmt; r += (wr - r) * satAmt;
         }
-    } else {
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            float *s = (float *)ioData->mBuffers[b].mData;
-            UInt32 n = ioData->mBuffers[b].mDataByteSize / sizeof(float);
-            if (!s) continue;
-            int c = b > 1 ? 1 : (int)b;
-            for (UInt32 i = 0; i < n; i++) {
-                s[i] = processSample(s[i], c);
-                float a = fabsf(s[i]); if (a > post) post = a;
+
+        // Largeur stéréo + balance
+        float m = (l + r) * 0.5f, s = (l - r) * 0.5f * width;
+        l = (m + s) * gl; r = (m - s) * gr;
+
+        // Écho ping-pong (le tampon est toujours alimenté)
+        int ri = echoIdx - echoDelay; if (ri < 0) ri += ECHO_MAX;
+        float dl = echoBuf[0][ri], dr = echoBuf[1][ri];
+        echoBuf[0][echoIdx] = l + dr * echoFb;
+        echoBuf[1][echoIdx] = r + dl * echoFb;
+        if (++echoIdx >= ECHO_MAX) echoIdx = 0;
+        l += dl * echoMix; r += dr * echoMix;
+
+        // Reverb
+        if (doRev) {
+            float in = (l + r) * 0.015f;
+            float sum[2] = {0, 0};
+            for (int c = 0; c < 2; c++) {
+                for (int k = 0; k < COMB_N; k++) {
+                    float *buf = combBuf[c][k];
+                    int idx = combIdx[c][k];
+                    float o = buf[idx];
+                    float fsv = o * (1.0f - damp) + combStore[c][k] * damp;
+                    if (fabsf(fsv) < 1e-20f) fsv = 0.f;
+                    combStore[c][k] = fsv;
+                    buf[idx] = in + fsv * revFb;
+                    if (++idx >= combLen[c][k]) idx = 0;
+                    combIdx[c][k] = idx;
+                    sum[c] += o;
+                }
+                for (int k = 0; k < AP_N; k++) {
+                    float *buf = apBuf[c][k];
+                    int idx = apIdx[c][k];
+                    float bo = buf[idx];
+                    float inp = sum[c];
+                    sum[c] = -inp + bo;
+                    buf[idx] = inp + bo * 0.5f;
+                    if (++idx >= apLen[c][k]) idx = 0;
+                    apIdx[c][k] = idx;
+                }
             }
+            l = l * dryGain + sum[0] * wetGain;
+            r = r * dryGain + sum[1] * wetGain;
         }
+
+        // Volume + limiteur
+        l = limiter(l * volLin); r = limiter(r * volLin);
+        pl[i * stride] = l; pr[i * stride] = r;
+
+        float a = fabsf(l); if (a > post) post = a;
+        a = fabsf(r); if (a > post) post = a;
     }
 
     int p2 = (int)(post * 1000.f);
@@ -178,7 +339,6 @@ static OSStatus my_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID p, Audi
 
 // ================= UI =================
 
-// Fenêtre qui laisse passer les touches sauf sur nos vues
 @interface FXWindow : UIWindow
 @end
 @implementation FXWindow
@@ -190,53 +350,98 @@ static OSStatus my_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID p, Audi
 @end
 
 static FXWindow *gWindow;
+static UIViewController *gVC;
 static UIView *gPanel;
+static UIButton *gBtn;
 static BOOL gUIBuilt = NO;
+static NSMutableArray<UISlider *> *gSliders;
+static NSMutableArray<UILabel *> *gLabels;
 
 static void saveParams(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setFloat:atomic_load(&gBassDb) forKey:@"fx_bass"];
-    [d setFloat:atomic_load(&gTrebleDb) forKey:@"fx_treble"];
-    [d setFloat:atomic_load(&gGainDb) forKey:@"fx_gain"];
-    [d setBool:atomic_load(&gActive) forKey:@"fx_active"];
+    for (int i = 0; i < P_COUNT; i++) [d setFloat:GP(i) forKey:[NSString stringWithFormat:@"fx2_%d", i]];
+    [d setBool:atomic_load(&gActive) forKey:@"fx2_active"];
 }
 
 static void loadParams(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:@"fx_bass"]) atomic_store(&gBassDb, [d floatForKey:@"fx_bass"]);
-    if ([d objectForKey:@"fx_treble"]) atomic_store(&gTrebleDb, [d floatForKey:@"fx_treble"]);
-    if ([d objectForKey:@"fx_gain"]) atomic_store(&gGainDb, [d floatForKey:@"fx_gain"]);
-    if ([d objectForKey:@"fx_active"]) atomic_store(&gActive, [d boolForKey:@"fx_active"] ? 1 : 0);
+    for (int i = 0; i < P_COUNT; i++) {
+        NSString *k = [NSString stringWithFormat:@"fx2_%d", i];
+        float v = [d objectForKey:k] ? [d floatForKey:k] : kDefs[i].def;
+        if (v < kDefs[i].min) v = kDefs[i].min;
+        if (v > kDefs[i].max) v = kDefs[i].max;
+        atomic_store(&gP[i], v);
+    }
+    if ([d objectForKey:@"fx2_active"]) atomic_store(&gActive, [d boolForKey:@"fx2_active"] ? 1 : 0);
 }
 
-@interface FXButtonTarget : NSObject
+static NSString *labelText(int i, float v) {
+    NSString *n = [NSString stringWithUTF8String:kDefs[i].name];
+    if (!strcmp(kDefs[i].unit, "dB")) return [NSString stringWithFormat:@"%@ : %+.1f dB", n, v];
+    return [NSString stringWithFormat:@"%@ : %.0f %s", n, v, kDefs[i].unit];
+}
+
+static void clampButton(void) {
+    CGRect b = gVC.view.bounds;
+    UIEdgeInsets in = gVC.view.safeAreaInsets;
+    CGFloat minX = in.left + 26, maxX = b.size.width - in.right - 26;
+    CGFloat minY = in.top + 26, maxY = b.size.height - in.bottom - 26;
+    CGPoint c = gBtn.center;
+    if (c.x < minX) c.x = minX; if (c.x > maxX) c.x = maxX;
+    if (c.y < minY) c.y = minY; if (c.y > maxY) c.y = maxY;
+    gBtn.center = c;
+}
+
+static void layoutPanel(void) {
+    CGRect b = gVC.view.bounds;
+    UIEdgeInsets in = gVC.view.safeAreaInsets;
+    CGFloat pw = MIN(300.0, b.size.width - 16);
+    CGFloat avail = b.size.height - in.top - in.bottom - 16;
+    CGFloat ph = MIN(480.0, avail);
+    CGFloat x = gBtn.frame.origin.x;
+    if (x > b.size.width - pw - 8) x = b.size.width - pw - 8;
+    if (x < 8) x = 8;
+    CGFloat y = CGRectGetMaxY(gBtn.frame) + 8;
+    if (y + ph > b.size.height - in.bottom - 8) {
+        y = gBtn.frame.origin.y - 8 - ph;
+        if (y < in.top + 8) y = MAX(in.top + 8, b.size.height - in.bottom - 8 - ph);
+    }
+    gPanel.frame = CGRectMake(x, y, pw, ph);
+}
+
+@interface FXTarget : NSObject
 - (void)toggle;
+- (void)pan:(UIPanGestureRecognizer *)g;
+- (void)reset;
 @end
-@implementation FXButtonTarget
-- (void)toggle { gPanel.hidden = !gPanel.hidden; }
-@end
-static FXButtonTarget *gTarget;
-
-static void addSlider(UIView *parent, NSString *name, CGFloat y, float min, float max, float initial,
-                      void (^onChange)(float)) {
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 248, 20)];
-    label.textColor = UIColor.whiteColor;
-    label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    label.text = [NSString stringWithFormat:@"%@ : %+.1f dB", name, initial];
-    [parent addSubview:label];
-
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, y + 22, 248, 30)];
-    slider.minimumValue = min;
-    slider.maximumValue = max;
-    slider.value = initial;
-    [slider addAction:[UIAction actionWithHandler:^(__kindof UIAction *a) {
-        float v = roundf(slider.value * 2.0f) / 2.0f;   // pas de 0.5 dB
-        label.text = [NSString stringWithFormat:@"%@ : %+.1f dB", name, v];
-        onChange(v);
-        saveParams();
-    }] forControlEvents:UIControlEventValueChanged];
-    [parent addSubview:slider];
+@implementation FXTarget
+- (void)toggle {
+    gPanel.hidden = !gPanel.hidden;
+    if (!gPanel.hidden) { clampButton(); layoutPanel(); }
 }
+- (void)pan:(UIPanGestureRecognizer *)g {
+    UIView *sv = gBtn.superview;
+    CGPoint t = [g translationInView:sv];
+    gBtn.center = CGPointMake(gBtn.center.x + t.x, gBtn.center.y + t.y);
+    [g setTranslation:CGPointZero inView:sv];
+    clampButton();
+    layoutPanel();
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setFloat:gBtn.center.x forKey:@"fx2_bx"];
+        [d setFloat:gBtn.center.y forKey:@"fx2_by"];
+    }
+}
+- (void)reset {
+    for (int i = 0; i < P_COUNT; i++) {
+        atomic_store(&gP[i], kDefs[i].def);
+        gSliders[i].value = kDefs[i].def;
+        gLabels[i].text = labelText(i, kDefs[i].def);
+    }
+    saveParams();
+}
+@end
+static FXTarget *gTarget;
 
 static void buildUI(void) {
     if (gUIBuilt) return;
@@ -248,70 +453,102 @@ static void buildUI(void) {
             if (s.activationState == UISceneActivationStateForegroundActive) break;
         }
     }
-    if (!scene) return;   // on réessaiera à la prochaine activation
+    if (!scene) return;
 
     gUIBuilt = YES;
     gWindow = [[FXWindow alloc] initWithWindowScene:scene];
     gWindow.frame = scene.coordinateSpace.bounds;
     gWindow.windowLevel = UIWindowLevelAlert + 100;
     gWindow.backgroundColor = UIColor.clearColor;
-    UIViewController *vc = [UIViewController new];
-    vc.view.backgroundColor = UIColor.clearColor;
-    gWindow.rootViewController = vc;
+    gVC = [UIViewController new];
+    gVC.view.backgroundColor = UIColor.clearColor;
+    gWindow.rootViewController = gVC;
     gWindow.hidden = NO;
 
-    gTarget = [FXButtonTarget new];
+    gTarget = [FXTarget new];
+    gSliders = [NSMutableArray new];
+    gLabels = [NSMutableArray new];
 
-    // Bouton FX
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(16, 70, 44, 44);
-    btn.backgroundColor = [UIColor colorWithRed:0.11 green:0.73 blue:0.33 alpha:0.95];
-    btn.layer.cornerRadius = 22;
-    [btn setTitle:@"FX" forState:UIControlStateNormal];
-    [btn setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [btn addTarget:gTarget action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-    [vc.view addSubview:btn];
+    // Bouton FX (déplaçable)
+    gBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    gBtn.frame = CGRectMake(0, 0, 48, 48);
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    CGFloat bx = [ud objectForKey:@"fx2_bx"] ? [ud floatForKey:@"fx2_bx"] : 40;
+    CGFloat by = [ud objectForKey:@"fx2_by"] ? [ud floatForKey:@"fx2_by"] : 100;
+    gBtn.center = CGPointMake(bx, by);
+    gBtn.backgroundColor = [UIColor colorWithRed:0.11 green:0.73 blue:0.33 alpha:0.95];
+    gBtn.layer.cornerRadius = 24;
+    [gBtn setTitle:@"FX" forState:UIControlStateNormal];
+    [gBtn setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
+    gBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [gBtn addTarget:gTarget action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gTarget action:@selector(pan:)];
+    [gBtn addGestureRecognizer:pan];
+    [gVC.view addSubview:gBtn];
 
     // Panel
-    gPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 122, 280, 290)];
-    gPanel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
+    CGFloat pw = 300, ph = 480;
+    gPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 160, pw, ph)];
+    gPanel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
     gPanel.layer.cornerRadius = 16;
+    gPanel.clipsToBounds = YES;
     gPanel.hidden = YES;
-    [vc.view addSubview:gPanel];
+    [gVC.view addSubview:gPanel];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, 150, 24)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, 180, 24)];
     title.text = @"SpotifyFX";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:17];
     [gPanel addSubview:title];
 
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(210, 8, 51, 31)];
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 8, 51, 31)];
     sw.on = atomic_load(&gActive) != 0;
+    sw.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [sw addAction:[UIAction actionWithHandler:^(__kindof UIAction *a) {
         atomic_store(&gActive, sw.on ? 1 : 0);
         saveParams();
     }] forControlEvents:UIControlEventValueChanged];
     [gPanel addSubview:sw];
 
-    addSlider(gPanel, @"Basses", 52, -12, 12, atomic_load(&gBassDb), ^(float v) { atomic_store(&gBassDb, v); });
-    addSlider(gPanel, @"Aigus", 118, -12, 12, atomic_load(&gTrebleDb), ^(float v) { atomic_store(&gTrebleDb, v); });
-    addSlider(gPanel, @"Volume", 184, -12, 6, atomic_load(&gGainDb), ^(float v) { atomic_store(&gGainDb, v); });
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 48, pw, ph - 48 - 48)];
+    scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scroll.showsVerticalScrollIndicator = YES;
+    scroll.contentSize = CGSizeMake(pw, 8 + P_COUNT * 62 + 8);
+    [gPanel addSubview:scroll];
+
+    for (int i = 0; i < P_COUNT; i++) {
+        CGFloat y = 8 + i * 62;
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(16, y, pw - 32, 20)];
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        label.text = labelText(i, GP(i));
+        [scroll addSubview:label];
+
+        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, y + 24, pw - 32, 30)];
+        slider.minimumValue = kDefs[i].min;
+        slider.maximumValue = kDefs[i].max;
+        slider.value = GP(i);
+        BOOL isDb = !strcmp(kDefs[i].unit, "dB");
+        [slider addAction:[UIAction actionWithHandler:^(__kindof UIAction *a) {
+            float v = isDb ? roundf(slider.value * 2.0f) / 2.0f : roundf(slider.value);
+            label.text = labelText(i, v);
+            atomic_store(&gP[i], v);
+            saveParams();
+        }] forControlEvents:UIControlEventValueChanged];
+        [scroll addSubview:slider];
+
+        [gSliders addObject:slider];
+        [gLabels addObject:label];
+    }
 
     UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
-    reset.frame = CGRectMake(16, 248, 248, 32);
+    reset.frame = CGRectMake(16, ph - 42, pw - 32, 34);
+    reset.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
     [reset setTitle:@"Réinitialiser" forState:UIControlStateNormal];
-    [reset addAction:[UIAction actionWithHandler:^(__kindof UIAction *a) {
-        atomic_store(&gBassDb, 0.0f); atomic_store(&gTrebleDb, 0.0f); atomic_store(&gGainDb, 0.0f);
-        saveParams();
-        // reconstruit le panel avec les valeurs à zéro
-        [gPanel removeFromSuperview];
-        gUIBuilt = NO; gWindow.hidden = YES; gWindow = nil;
-        buildUI();
-        gPanel.hidden = NO;
-    }] forControlEvents:UIControlEventTouchUpInside];
+    [reset addTarget:gTarget action:@selector(reset) forControlEvents:UIControlEventTouchUpInside];
     [gPanel addSubview:reset];
 
+    clampButton();
     FXLog(@"Panel créé");
 }
 
@@ -319,7 +556,8 @@ static dispatch_source_t keepTimer;
 
 __attribute__((constructor))
 static void init(void) {
-    FXLog(@"SpotifyFX chargée (panel)");
+    FXLog(@"SpotifyFX chargée (panel v2)");
+    for (int i = 0; i < P_COUNT; i++) atomic_store(&gP[i], kDefs[i].def);
     loadParams();
 
     rebind_symbols((struct rebinding[]){
@@ -336,10 +574,10 @@ static void init(void) {
     }];
 
     keepTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-    dispatch_source_set_timer(keepTimer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, 0);
+    dispatch_source_set_timer(keepTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), 10 * NSEC_PER_SEC, 0);
     dispatch_source_set_event_handler(keepTimer, ^{
-        FXLog([NSString stringWithFormat:@"bass=%.1f treble=%.1f gain=%.1f active=%d cb=%d peak=%d",
-               atomic_load(&gBassDb), atomic_load(&gTrebleDb), atomic_load(&gGainDb),
+        FXLog([NSString stringWithFormat:@"vol=%.1f bass=%.1f treble=%.1f rev=%.0f echo=%.0f active=%d cb=%d peak=%d",
+               GP(P_VOL), GP(P_BASS), GP(P_TREBLE), GP(P_REVMIX), GP(P_ECHOMIX),
                atomic_load(&gActive), atomic_load(&cCallback), atomic_exchange(&peakPost, 0)]);
     });
     dispatch_resume(keepTimer);
