@@ -6,6 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 static void FXLog(NSString *msg) {
     NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -65,7 +70,7 @@ static atomic_int peakPost;
 typedef struct { float b0, b1, b2, a1, a2; } Coef;
 typedef struct { float z1, z2; } State;
 
-static Coef gCoef[3] = {{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0}};   // 0 basses, 1 médiums, 2 aigus
+static Coef gCoef[3] = {{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0}};
 static State gSt[3][2];
 static float gCEq[6] = {-999,-999,-999,-999,-999,-999};
 
@@ -180,7 +185,6 @@ static OSStatus fx_render(void *inRefCon,
     if (!atomic_load(&outIsFloat)) return st;
     if (!atomic_load(&gActive)) return st;
 
-    // Accès aux canaux (entrelacé ou non)
     float *pl = NULL, *pr = NULL;
     UInt32 stride = 1, frames = 0;
     if (ioData->mNumberBuffers == 1) {
@@ -200,7 +204,6 @@ static OSStatus fx_render(void *inRefCon,
         frames = (a < b ? a : b) / sizeof(float);
     } else return st;
 
-    // --- Lecture des paramètres ---
     float fs = atomic_load(&gSampleRate);
     float eq[6] = { GP(P_BASS), GP(P_MID), GP(P_TREBLE), GP(P_BASSF), GP(P_TREBF), fs };
     int changed = 0;
@@ -241,21 +244,17 @@ static OSStatus fx_render(void *inRefCon,
     for (UInt32 i = 0; i < frames; i++) {
         float l = pl[i * stride], r = pr[i * stride];
 
-        // EQ : basses, médiums, aigus
         l = biq(&gCoef[0], &gSt[0][0], l); l = biq(&gCoef[1], &gSt[1][0], l); l = biq(&gCoef[2], &gSt[2][0], l);
         r = biq(&gCoef[0], &gSt[0][1], r); r = biq(&gCoef[1], &gSt[1][1], r); r = biq(&gCoef[2], &gSt[2][1], r);
 
-        // Saturation
         if (satAmt > 0.001f) {
             float wl = tanhf(l * drive) * satComp, wr = tanhf(r * drive) * satComp;
             l += (wl - l) * satAmt; r += (wr - r) * satAmt;
         }
 
-        // Largeur stéréo + balance
         float m = (l + r) * 0.5f, s = (l - r) * 0.5f * width;
         l = (m + s) * gl; r = (m - s) * gr;
 
-        // Écho ping-pong (le tampon est toujours alimenté)
         int ri = echoIdx - echoDelay; if (ri < 0) ri += ECHO_MAX;
         float dl = echoBuf[0][ri], dr = echoBuf[1][ri];
         echoBuf[0][echoIdx] = l + dr * echoFb;
@@ -263,7 +262,6 @@ static OSStatus fx_render(void *inRefCon,
         if (++echoIdx >= ECHO_MAX) echoIdx = 0;
         l += dl * echoMix; r += dr * echoMix;
 
-        // Reverb
         if (doRev) {
             float in = (l + r) * 0.015f;
             float sum[2] = {0, 0};
@@ -295,7 +293,6 @@ static OSStatus fx_render(void *inRefCon,
             r = r * dryGain + sum[1] * wetGain;
         }
 
-        // Volume + limiteur
         l = limiter(l * volLin); r = limiter(r * volLin);
         pl[i * stride] = l; pr[i * stride] = r;
 
@@ -337,6 +334,36 @@ static OSStatus my_AudioUnitSetProperty(AudioUnit u, AudioUnitPropertyID p, Audi
     return orig_AudioUnitSetProperty(u, p, s, e, d, sz);
 }
 
+// ================= RÉSEAU : adresse + code =================
+
+static NSString *gToken;
+static int gPort = 0;
+
+static NSString *localIP(void) {
+    NSString *res = nil;
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) == 0) {
+        for (struct ifaddrs *a = list; a; a = a->ifa_next) {
+            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+            if (strcmp(a->ifa_name, "en0") != 0) continue;
+            char buf[INET_ADDRSTRLEN];
+            struct sockaddr_in *sin = (struct sockaddr_in *)a->ifa_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+            res = [NSString stringWithUTF8String:buf];
+            break;
+        }
+        freeifaddrs(list);
+    }
+    return res;
+}
+
+static NSString *urlString(void) {
+    if (!gPort) return @"Serveur non démarré";
+    NSString *ip = localIP();
+    if (!ip) return @"Pas de Wi-Fi détecté";
+    return [NSString stringWithFormat:@"http://%@:%d/?k=%@", ip, gPort, gToken];
+}
+
 // ================= UI =================
 
 @interface FXWindow : UIWindow
@@ -353,6 +380,7 @@ static FXWindow *gWindow;
 static UIViewController *gVC;
 static UIView *gPanel;
 static UIButton *gBtn;
+static UILabel *gURLLabel;
 static BOOL gUIBuilt = NO;
 static NSMutableArray<UISlider *> *gSliders;
 static NSMutableArray<UILabel *> *gLabels;
@@ -409,6 +437,17 @@ static void layoutPanel(void) {
     gPanel.frame = CGRectMake(x, y, pw, ph);
 }
 
+// Met à jour les sliders du panel de l'iPad (appelé après un changement venant du web)
+static void syncUI(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gUIBuilt) return;
+        for (int i = 0; i < P_COUNT; i++) {
+            gSliders[i].value = GP(i);
+            gLabels[i].text = labelText(i, GP(i));
+        }
+    });
+}
+
 @interface FXTarget : NSObject
 - (void)toggle;
 - (void)pan:(UIPanGestureRecognizer *)g;
@@ -417,7 +456,7 @@ static void layoutPanel(void) {
 @implementation FXTarget
 - (void)toggle {
     gPanel.hidden = !gPanel.hidden;
-    if (!gPanel.hidden) { clampButton(); layoutPanel(); }
+    if (!gPanel.hidden) { gURLLabel.text = urlString(); clampButton(); layoutPanel(); }
 }
 - (void)pan:(UIPanGestureRecognizer *)g {
     UIView *sv = gBtn.superview;
@@ -433,15 +472,169 @@ static void layoutPanel(void) {
     }
 }
 - (void)reset {
-    for (int i = 0; i < P_COUNT; i++) {
-        atomic_store(&gP[i], kDefs[i].def);
-        gSliders[i].value = kDefs[i].def;
-        gLabels[i].text = labelText(i, kDefs[i].def);
-    }
+    for (int i = 0; i < P_COUNT; i++) atomic_store(&gP[i], kDefs[i].def);
     saveParams();
+    syncUI();
 }
 @end
 static FXTarget *gTarget;
+
+// ================= SERVEUR WEB =================
+
+static NSString *pageHTML(void) {
+    return @"<!doctype html><html><head><meta charset='utf-8'>"
+    @"<meta name='viewport' content='width=device-width,initial-scale=1'><title>SpotifyFX</title>"
+    @"<style>body{background:#111;color:#fff;font-family:-apple-system,sans-serif;margin:0 auto;padding:16px;max-width:560px}"
+    @"h1{font-size:20px;color:#1db954}.r{margin:16px 0}.t{display:flex;justify-content:space-between;font-size:15px;margin-bottom:4px}"
+    @"input[type=range]{width:100%;accent-color:#1db954}"
+    @"button{background:#1db954;border:0;border-radius:10px;padding:10px 16px;font-size:16px;margin:4px 6px 4px 0}</style></head>"
+    @"<body><h1>SpotifyFX</h1><div><button id='on'></button><button id='rs'>Réinitialiser</button></div><div id='c'></div>"
+    @"<script>"
+    @"var K=new URLSearchParams(location.search).get('k')||'';var P=[],act=1;"
+    @"function api(p){return fetch('/api/'+p+(p.indexOf('?')<0?'?':'&')+'k='+K).then(function(r){return r.json()})}"
+    @"function fmt(p,v){return p.unit=='dB'?(v>0?'+':'')+v.toFixed(1)+' dB':Math.round(v)+' '+p.unit}"
+    @"function btn(){document.getElementById('on').textContent=act?'Effets : ON':'Effets : OFF'}"
+    @"function draw(st){act=st.active;P=st.params;var c=document.getElementById('c');c.innerHTML='';"
+    @"P.forEach(function(p,i){var d=document.createElement('div');d.className='r';"
+    @"var t=document.createElement('div');t.className='t';var n=document.createElement('span');n.textContent=p.name;"
+    @"var v=document.createElement('span');v.textContent=fmt(p,p.v);t.appendChild(n);t.appendChild(v);"
+    @"var s=document.createElement('input');s.type='range';s.min=p.min;s.max=p.max;s.step=p.unit=='dB'?0.5:1;s.value=p.v;"
+    @"var w=0;s.oninput=function(){var x=parseFloat(s.value);v.textContent=fmt(p,x);var now=Date.now();if(now-w>60){w=now;api('set?i='+i+'&v='+x)}};"
+    @"s.onchange=function(){api('set?i='+i+'&v='+s.value)};"
+    @"d.appendChild(t);d.appendChild(s);c.appendChild(d)});btn()}"
+    @"document.getElementById('on').onclick=function(){act=act?0:1;api('active?v='+act);btn()};"
+    @"document.getElementById('rs').onclick=function(){api('reset').then(draw)};"
+    @"api('state').then(draw).catch(function(){document.getElementById('c').textContent='Code incorrect ou serveur injoignable'});"
+    @"</script></body></html>";
+}
+
+static NSData *stateJSON(void) {
+    NSMutableArray *arr = [NSMutableArray new];
+    for (int i = 0; i < P_COUNT; i++) {
+        [arr addObject:@{
+            @"name": [NSString stringWithUTF8String:kDefs[i].name],
+            @"unit": [NSString stringWithUTF8String:kDefs[i].unit],
+            @"min": @(kDefs[i].min), @"max": @(kDefs[i].max), @"def": @(kDefs[i].def),
+            @"v": @(GP(i))
+        }];
+    }
+    NSDictionary *d = @{ @"active": @(atomic_load(&gActive)), @"params": arr };
+    return [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+}
+
+static NSString *qv(NSURLComponents *uc, NSString *name) {
+    for (NSURLQueryItem *it in uc.queryItems) if ([it.name isEqualToString:name]) return it.value;
+    return nil;
+}
+
+static void sendAll(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n <= 0) return;
+        p += n; len -= (size_t)n;
+    }
+}
+
+static void sendResp(int fd, int code, const char *ctype, NSData *body) {
+    char head[256];
+    int hl = snprintf(head, sizeof(head),
+        "HTTP/1.1 %d OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        code, ctype, (unsigned long)body.length);
+    sendAll(fd, head, (size_t)hl);
+    sendAll(fd, body.bytes, body.length);
+}
+
+static void handleClient(int fd) {
+    @autoreleasepool {
+        struct timeval tv = {3, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+        char buf[4096];
+        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) { close(fd); return; }
+        buf[n] = 0;
+        char *eol = strstr(buf, "\r\n");
+        if (eol) *eol = 0;
+
+        NSString *line = [NSString stringWithUTF8String:buf];
+        NSArray *parts = [line componentsSeparatedByString:@" "];
+        if (parts.count < 2) { close(fd); return; }
+        NSURLComponents *uc = [NSURLComponents componentsWithString:[@"http://h" stringByAppendingString:parts[1]]];
+        NSString *path = uc.path ?: @"/";
+
+        if (![qv(uc, @"k") isEqualToString:gToken]) {
+            sendResp(fd, 403, "text/plain; charset=utf-8", [@"Code incorrect" dataUsingEncoding:NSUTF8StringEncoding]);
+            close(fd); return;
+        }
+
+        if ([path isEqualToString:@"/"]) {
+            sendResp(fd, 200, "text/html; charset=utf-8", [pageHTML() dataUsingEncoding:NSUTF8StringEncoding]);
+        } else if ([path isEqualToString:@"/api/state"]) {
+            sendResp(fd, 200, "application/json", stateJSON());
+        } else if ([path isEqualToString:@"/api/set"]) {
+            NSString *si = qv(uc, @"i"), *sv = qv(uc, @"v");
+            if (si && sv) {
+                int i = [si intValue];
+                float v = [sv floatValue];
+                if (i >= 0 && i < P_COUNT && isfinite(v)) {
+                    if (v < kDefs[i].min) v = kDefs[i].min;
+                    if (v > kDefs[i].max) v = kDefs[i].max;
+                    atomic_store(&gP[i], v);
+                    saveParams();
+                    syncUI();
+                }
+            }
+            sendResp(fd, 200, "application/json", [@"{\"ok\":1}" dataUsingEncoding:NSUTF8StringEncoding]);
+        } else if ([path isEqualToString:@"/api/active"]) {
+            atomic_store(&gActive, [qv(uc, @"v") intValue] ? 1 : 0);
+            saveParams();
+            sendResp(fd, 200, "application/json", [@"{\"ok\":1}" dataUsingEncoding:NSUTF8StringEncoding]);
+        } else if ([path isEqualToString:@"/api/reset"]) {
+            for (int i = 0; i < P_COUNT; i++) atomic_store(&gP[i], kDefs[i].def);
+            saveParams();
+            syncUI();
+            sendResp(fd, 200, "application/json", stateJSON());
+        } else {
+            sendResp(fd, 404, "text/plain; charset=utf-8", [@"Introuvable" dataUsingEncoding:NSUTF8StringEncoding]);
+        }
+        close(fd);
+    }
+}
+
+static void startServer(void) {
+    [NSThread detachNewThreadWithBlock:^{
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { FXLog(@"Serveur : socket() a échoué"); return; }
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        int port = 0;
+        for (int p = 8080; p <= 8090; p++) {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_len = sizeof(addr);
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons((uint16_t)p);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) == 0) { port = p; break; }
+        }
+        if (!port || listen(srv, 8) != 0) { FXLog(@"Serveur : bind/listen impossible"); close(srv); return; }
+        gPort = port;
+        FXLog([NSString stringWithFormat:@"Serveur démarré : %@", urlString()]);
+
+        dispatch_queue_t q = dispatch_queue_create("fx.http", DISPATCH_QUEUE_CONCURRENT);
+        while (1) {
+            int c = accept(srv, NULL, NULL);
+            if (c < 0) { usleep(100000); continue; }
+            dispatch_async(q, ^{ handleClient(c); });
+        }
+    }];
+}
+
+// ================= CONSTRUCTION DE L'UI =================
 
 static void buildUI(void) {
     if (gUIBuilt) return;
@@ -469,7 +662,6 @@ static void buildUI(void) {
     gSliders = [NSMutableArray new];
     gLabels = [NSMutableArray new];
 
-    // Bouton FX (déplaçable)
     gBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     gBtn.frame = CGRectMake(0, 0, 48, 48);
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
@@ -486,7 +678,6 @@ static void buildUI(void) {
     [gBtn addGestureRecognizer:pan];
     [gVC.view addSubview:gBtn];
 
-    // Panel
     CGFloat pw = 300, ph = 480;
     gPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 160, pw, ph)];
     gPanel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.95];
@@ -495,11 +686,19 @@ static void buildUI(void) {
     gPanel.hidden = YES;
     [gVC.view addSubview:gPanel];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, 180, 24)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 8, 180, 24)];
     title.text = @"SpotifyFX";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:17];
     [gPanel addSubview:title];
+
+    gURLLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 32, pw - 32, 16)];
+    gURLLabel.textColor = [UIColor colorWithWhite:0.65 alpha:1];
+    gURLLabel.font = [UIFont systemFontOfSize:11];
+    gURLLabel.adjustsFontSizeToFitWidth = YES;
+    gURLLabel.minimumScaleFactor = 0.6;
+    gURLLabel.text = urlString();
+    [gPanel addSubview:gURLLabel];
 
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 8, 51, 31)];
     sw.on = atomic_load(&gActive) != 0;
@@ -510,7 +709,7 @@ static void buildUI(void) {
     }] forControlEvents:UIControlEventValueChanged];
     [gPanel addSubview:sw];
 
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 48, pw, ph - 48 - 48)];
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 54, pw, ph - 54 - 48)];
     scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     scroll.showsVerticalScrollIndicator = YES;
     scroll.contentSize = CGSizeMake(pw, 8 + P_COUNT * 62 + 8);
@@ -556,13 +755,23 @@ static dispatch_source_t keepTimer;
 
 __attribute__((constructor))
 static void init(void) {
-    FXLog(@"SpotifyFX chargée (panel v2)");
+    FXLog(@"SpotifyFX chargée (panel v3 + contrôle web)");
     for (int i = 0; i < P_COUNT; i++) atomic_store(&gP[i], kDefs[i].def);
     loadParams();
+
+    // Code d'accès (généré une fois, puis conservé)
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    gToken = [ud stringForKey:@"fx2_token"];
+    if (!gToken) {
+        gToken = [NSString stringWithFormat:@"%u", 1000 + arc4random_uniform(9000)];
+        [ud setObject:gToken forKey:@"fx2_token"];
+    }
 
     rebind_symbols((struct rebinding[]){
         {"AudioUnitSetProperty", my_AudioUnitSetProperty, (void *)&orig_AudioUnitSetProperty},
     }, 1);
+
+    startServer();
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
